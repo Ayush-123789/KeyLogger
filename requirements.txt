@@ -1,0 +1,10 @@
+pynput
+pyscreenshot
+sounddevice
+Pillow
+requests
+pywin32
+pycryptodomex
+PyQt5
+psutil
+scipy
